@@ -2,13 +2,13 @@ import numpy as np
 import math as m
 import statistics as stat
 import matplotlib.pyplot as plt
-import pandas as pd
 import random as rnd
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from sklearn import preprocessing as pre
 
 from collections import deque
 
@@ -17,9 +17,10 @@ import copy
 import time
 from statistics import pvariance, variance, stdev
 import seaborn as sns
+import pandas as pd
 
-in_features = 3
-
+in_features = 4
+scaler = pre.MinMaxScaler(feature_range=(-1, 1))
 
 class DQN(nn.Module):
     '''
@@ -44,7 +45,7 @@ class DQN(nn.Module):
 
 class Ambiente():
 
-    def __init__(self, S0 = 10, mu = -0.001, kappa = 5, theta = 1, sigma = 0.1, lambd = 0.1, t0 = 0, t = 1, T = 3600, inv = 20): #mu = 1e-10 T = 1.0, M = 7200, I = 1_000 mu = 0.01
+    def __init__(self, S0 = 10, mu = -0.001, kappa = 5, theta = 1, sigma = 0.1, lambd = 0.1, t0 = 0, t = 1, T = 3600, inv = 20): #T = 1.0, M = 7200, I = 1_000 mu = 0.01
         
         self.S0 = S0
         self.mu = mu
@@ -74,6 +75,50 @@ class Ambiente():
             X[i + 1] = X[i] + self.mu * dt + self.sigma * np.sqrt(dt) * np.random.standard_normal(I) 
     
         return np.abs(X)
+
+    def abmUD(self, seed = 14, numIt = 10):
+        '''
+        returns a matrix of Arithmetic Brownian Motion paths, p=0.5 mu = +0.001 or p=0.5 mu = -0.001
+        '''
+        X = np.zeros((3600 + 1, numIt), dtype=float)
+        np.random.seed(seed)
+
+        def up():
+
+            N = 3600
+            I = 1
+            dt= 1.0 / 3600
+            X = np.zeros((N + 1, I), dtype=float)
+            X[0] = 10
+
+            for i in range(N):
+                X[i + 1] = X[i] + self.mu * dt + self.sigma * np.sqrt(dt) * np.random.standard_normal(I)
+            return X
+
+        def dn():
+
+            N = 3600
+            I = 1
+            dt= 1.0 / 3600
+            X = np.zeros((N + 1, I), dtype=float)
+            X[0] = 10
+            for i in range(N):
+                X[i + 1] = X[i] - self.mu * dt + self.sigma * np.sqrt(dt) * np.random.standard_normal(I)
+            return X
+
+        for i in range(numIt):
+
+            c = np.random.binomial(1, 0.5)
+            if i%2 == 0:#c == 0:
+
+                X[:,i] = dn().reshape(-1)
+            else :
+
+                X[:,i] = up().reshape(-1)
+
+        np.random.shuffle(X.T)
+
+        return X
 
     def inventory_action_transform(self, q, x):
 
@@ -108,7 +153,7 @@ class Ambiente():
 
         return qdr_var
 
-    def price_normalise(self, price, min_p, max_p):
+    def price_normalise_old(self, price, min_p, max_p):
 
         middle_point = (max_p + min_p) / 2
         half_length = (max_p - min_p) / 2
@@ -116,15 +161,29 @@ class Ambiente():
         price = (price - middle_point) / half_length
 
         return price
+    
+    def price_normalise(self, price, min_p, max_p):
+        """
+        Normalizes a matrix of real numbers between 1 and -1 domain using min-max normalization.
+        """
+        # Find the minimum and maximum values for each column
+        min_vals = min_p 
+        max_vals = max_p 
+        range_vals = max_vals - min_vals
 
-    def normalise(self, inventory, time, x):
+        # Perform column-wise min-max normalization
+        normalized_matrix = 2 * (price - min_vals) / range_vals - 1
+
+        return normalized_matrix
+
+    def normalise(self, inventory, time, x, price, min_p, max_p):
         '''
         performs the normalisation in the range [-1,1] for the feature of the NN
         '''
         q, x = self.inventory_action_transform(inventory, x)
         t = self.time_transform(time)
-        #p = self.price_normalise(price, min_p, max_p)
-        return q, t,  x#p,
+        p = self.price_normalise_old(price, min_p, max_p)
+        return q, t, p, x
 
 class ReplayMemory():
     '''
@@ -135,9 +194,9 @@ class ReplayMemory():
 
         self.memory = deque([], maxlen=capacity)
 
-    def add(self, inv, time, x, next_inv, next_time, reward): #inv, time, price, var, x, next_state, reward state, action, next_state, reward
+    def add(self, inv, time, price, x, next_inv, next_time, next_price, reward): #inv, time, price, var, x, next_state, reward state, action, next_state, reward
         
-        self.memory.append([inv, time,  x, next_inv, next_time, reward])
+        self.memory.append([inv, time, price, x, next_inv, next_time, next_price, reward])
 
     def sample(self, batch_size):
         
@@ -156,7 +215,7 @@ class ReplayMemory():
 
 class Agente():
 
-    def __init__(self, inventario, numTrain, epsilon):
+    def __init__(self, inventario, numTrain):
 
         self.train = numTrain
         self.maxlen = 15_000
@@ -173,16 +232,16 @@ class Agente():
         self._update_target_net()
 
         self.learning_rate = 0.01
-        self.optimizer = optim.Adam(params=self.main_net.parameters(), lr=self.learning_rate)
+        self.optimizer = optim.RMSprop(self.main_net.parameters(), lr = self.learning_rate)   #optim.Adam(params=self.main_net.parameters(), lr=self.learning_rate)
         self.time_subdivisions = 5
         self.inventory = inventario
-        self.a_penalty = 0.001
-        self.epsilon = epsilon
+        self.a_penalty = 0.001#0.001
+        self.epsilon = 1
         self.epsilon_decay = 0.995
         self.batch_size = 128*2
         self.gamma = 1#0.99   ##############################################
         self.timestep = 0
-        self.update_target_steps = 200
+        self.update_target_steps = 200#####23_03_23
         self.lots_size = 100
         self.matrix = np.zeros((self.inventory + 1, self.time_subdivisions))
 
@@ -199,8 +258,8 @@ class Agente():
         '''
         if type == 'scalar' :
 
-            q, t, x = Ambiente().normalise(state[0], state[1], act)
-            in_features = torch.tensor([q, t , x], dtype=torch.float)
+            q, t, p, x = Ambiente().normalise(state[0], state[1], act, state[2], p_min, p_max)
+            in_features = torch.tensor([q, t, p, x], dtype=torch.float)
 
         if type == 'tensor':
 
@@ -208,8 +267,8 @@ class Agente():
 
             for i in range(len(state)):
 
-                q, t,  x = Ambiente().normalise(state[i][0], state[i][1], act[i])
-                features.append(torch.tensor([q, t , x], dtype=torch.float))
+                q, t, p, x = Ambiente().normalise(state[i][0], state[i][1], act[i], state[i][2], p_min, p_max)
+                features.append(torch.tensor([q, t, p, x], dtype=torch.float))
 
             in_features = torch.stack(features)
             in_features.type(torch.float)
@@ -233,8 +292,8 @@ class Agente():
 
             for i in range(int(state[0] + 1)):
 
-                q, t , x = Ambiente().normalise(state[0], state[1], i) 
-                features.append(torch.tensor([q, t , x], dtype=torch.float))
+                q, t, p, x = Ambiente().normalise(state[0], state[1], i, state[2], min_p, max_p) 
+                features.append(torch.tensor([q, t, p, x], dtype=torch.float))
 
             qs_value = self.main_net.forward(torch.stack(features))
             action = torch.argmax(qs_value).item()
@@ -291,10 +350,10 @@ class Agente():
         '''
         #PROBLEMA E' QUI NEL SAMPLING E NELL'USO DI QUESTI SAMPLING
 
-        state       = [tup[:2] for tup in transitions ]
-        act         = [tup[2] for tup in transitions  ]
-        next_state  = [tup[3:5] for tup in transitions]
-        reward      = [tup[5] for tup in transitions  ]
+        state       = [tup[:3] for tup in transitions ]
+        act         = [tup[3] for tup in transitions  ]
+        next_state  = [tup[4:7] for tup in transitions]
+        reward      = [tup[7] for tup in transitions  ]
 
         current_Q = self.eval_Q(state, act, p_min, p_max,'tensor', 'main')
         target = []
@@ -353,7 +412,7 @@ class Agente():
         return loss.cpu().item(), grad_norm, self.matrix, self.epsilon
 
 
-    def test(self, inv, tempo, dati):
+    def test(self, inv, tempo, dati, p_min, p_max):
         '''
         does the testing on new data using the weights of the already trained NN
         '''
@@ -361,10 +420,10 @@ class Agente():
         #model.load_state_dict(torch.load('model.pth'))
         #torch.load_state()
         state = [inv, tempo, dati[0]]
-        p_min = dati.min()
-        p_max = dati.max()
+        #p_min = dati.min()
+        #p_max = dati.max()
 
-        if tempo >= 4:
+        if tempo > 4:
             x = inv
         else:
             x = self.action(state, p_min, p_max)
@@ -372,7 +431,7 @@ class Agente():
         reward = self.reward(inv, x, dati)
 
         new_inv = inv - x
-        next_state = [new_inv,    tempo + 1,    dati[-2]]
+        next_state = [new_inv, tempo + 1, x]
 
         return (new_inv, x, reward, next_state)
 
@@ -450,20 +509,20 @@ class Agente():
                     PeL += xs * data[t] - a * (xs ** 2)
         return PeL
 
-    def step(self, inv, tempo, data):
+    def step(self, inv, tempo, data, p_min, p_max):
         '''
         function that manages the states, performs the action and calculates the reward, in addition it fills up the replay buffer 
         and halves it when it fills up
         '''
         #iter = 1
         self.timestep += 1
-        state = [inv, tempo]
-        p_min, p_max = data.min(), data.max()
+        state = [inv, tempo, data[0]]
+        #p_min, p_max = data.min(), data.max()
         x = self.action(state, p_min, p_max)
         r = self.reward(inv, x, data)
         new_inv = inv - x
-        next_state = [new_inv, tempo + 1]
-        self.memory.add(state[0], state[1], x, next_state[0], next_state[1],  r)
+        next_state = [new_inv, tempo + 1, data[-2]]
+        self.memory.add(state[0], state[1], state[2], x, next_state[0], next_state[1], next_state[2], r)
 
         if len(self.memory) == self.maxlen:
 
@@ -471,7 +530,7 @@ class Agente():
 
         if len(self.memory) < self.batch_size:
 
-            return 1, 0, np.zeros((21,5)), 1, new_inv, x, r
+            return 1, 0,  np.zeros((21,5)), 1, new_inv, x, r
 
         else:
 
@@ -511,7 +570,11 @@ if __name__ == '__main__':
         rew_hist = []
         grad_hist = []
 
-        data = Ambiente().abm(numIt=numIt) #------> questa la faccio da fuori? NO
+        data = Ambiente().abm(numIt=numIt) #------> questa la faccio da fuori? NOUD
+        restart = data[-1]
+        scaler.fit(data)
+        min_p = np.min(data)#scaler.data_min_#
+        max_p = np.max(data)#scaler.data_max_#
 
         for j in tqdm(range(numIt)):
             slices = 5
@@ -522,7 +585,7 @@ if __name__ == '__main__':
             for i in tqdm(range(slices)):
 
                 dati = ss[i,:] # considero slice da 5 (720 osservazioni alla volta)
-                loss, grad, state, epsilon, new_inv, action, reward = age.step(inv, tempo, dati) 
+                loss, grad, state, epsilon, new_inv, action, reward = age.step(inv, tempo, dati, min_p, max_p) #passa il min ed il max dentro
                 inv = new_inv 
                 tempo += 1
                 rew_hist.append(reward)
@@ -534,10 +597,11 @@ if __name__ == '__main__':
         loss_mean, loss_sd = doAve(loss_hist)
         rew_mean, rew_sd = doAve(rew_hist)
 
-        return (act_mean, act_sd, act_hist, loss_mean, loss_sd, rew_mean, rew_sd, loss_hist, rew_hist, state, epsilon)
+        return (act_mean, act_sd, act_hist, loss_mean, loss_sd, rew_mean, rew_sd, loss_hist, rew_hist, state, epsilon, min_p, max_p, data[-1])
 
-    def doTest(age, numIt = 100):
-        data = Ambiente().abm(seed = 10, numIt=numIt)
+    def doTest(age, p_min, p_max, restart, numIt = 100):
+
+        data = Ambiente(S0 = restart[:numIt]).abm(numIt=numIt)
         act = []
         re = []
         transaction_cost_balance = []
@@ -557,8 +621,8 @@ if __name__ == '__main__':
                 
                 dati = ss[i,:]
                 selling_strategy = []#deque()
-                (new_inv, x, reward, next_state) = age.test(inv, tempo, dati)
-                states.append([inv, tempo, x])
+                (new_inv, x, reward, next_state) = age.test(inv, tempo, dati, p_min, p_max)
+                states.append([inv, tempo, dati[0], x]) ##########################################################################################
                 tempo += 1
                 inv = new_inv
                 re.append(reward)
@@ -567,9 +631,9 @@ if __name__ == '__main__':
                 
 
                 #transaction_cost_balance.append((age.PeL_QL(selling_strategy, dati) - age.PeL_TWAP(dati)) / (age.PeL_TWAP(dati)))
-                transaction_cost_balance.append((age.PeL_QL(selling_strategy, dati) - age.PeL_TWAP(dati) ) / age.PeL_TWAP(dati))
+                transaction_cost_balance.append((age.PeL_QL(selling_strategy, dati) - age.PeL_AC_with_drift(dati) ) / age.PeL_AC_with_drift(dati))
                 ql.append(np.asarray(age.PeL_QL(selling_strategy, dati))/5)
-                ac.append(np.asarray(age.PeL_TWAP(dati))/5)
+                ac.append(np.asarray(age.PeL_AC_with_drift(dati))/5)
         ql = np.asarray(ql)
         ac = np.asarray(ac)
         mean_list = (((ql.reshape(-1,5).sum(axis = 1) - ac.reshape(-1,5).sum(axis = 1)) / ac.reshape(-1,5).sum(axis = 1))/5).mean()*100#.append(stat.mean(np.asarray(transaction_cost_balance)))
@@ -596,7 +660,7 @@ if __name__ == '__main__':
         return array
     
     def heat_test(stati):
-        a=stati
+        a = stati
         df = pd.DataFrame(np.nan, index=np.arange(0,21), columns=['1', '2', '3', '4', '5'])
         df = df.fillna(-1)
         z = df.to_numpy()
@@ -610,15 +674,30 @@ if __name__ == '__main__':
         plt.title('states explored in test')
         plt.xlabel('time')
         plt.ylabel('inventory')
-        plt.savefig('./Desktop/a_grafici/Q_T/-0_001/explTest.png')
+        plt.savefig('./Desktop/ennesima/heatStatesTest')
         plt.close()
 
     def heat(states, actions = False):
         arr = states
+        #df = pd.DataFrame(np.nan, index=np.arange(0,21), columns=['1', '2', '3', '4', '5'])#np.zeros((21,5))
+        #df = df.fillna(-1)
+        #mask = df != -999
+        #zz = df.to_numpy()
+        #for i in range(len(zz)): #mx 20
+        #    for ii in range(6): #mx 5
+        #        for iii in range(len(zz[:])):
+        #            if i == np.asarray(arr)[:,0][iii] and ii == np.asarray(arr)[:,1][iii]:
+        #                zz[int(i),int(ii)] = np.asarray(arr)[iii,2]
+        #sns.heatmap(zz, cmap="YlGnBu" )
+        #plt.title('states visited in test phase')
+        #plt.xlabel('time')
+        #plt.ylabel('inventory')
+        #plt.show()
+        ###
         df = pd.DataFrame(np.nan, index=np.arange(0,21), columns=['1', '2', '3', '4', '5'])
         df = df.fillna(-1)
         z = df.to_numpy()#np.zeros((21,5))
-        ds = pd.DataFrame(arr,columns=['Q', 'T', 'x'])
+        ds = pd.DataFrame(arr,columns=['Q', 'T', 'p', 'x'])
         h = ds.groupby(['Q','T']).mean().reset_index()
         a = h.to_numpy()
         for i in range(21): #mx 20
@@ -630,71 +709,121 @@ if __name__ == '__main__':
         plt.title('average action conditioned to inventory and time')
         plt.xlabel('time')
         plt.ylabel('inventory')
-        plt.savefig('./Desktop/a_grafici/Q_T/-0_001/actionTest.png')
-        plt.close()
+        plt.show()
 
-
-    def plot_heat(states):
-        # Get the x, y, and z values
-        arr = np.asarray(states)
-
-        x = arr[:,1]
-        y = arr[:,0]
-        zz = arr[:,2]
+    def plot_heat_o(stati, p_min, p_max):
+        
         z = np.zeros((21,5))
-        ds = pd.DataFrame(arr,columns=['Q', 'T', 'x'])
-        h = ds.groupby(['Q','T']).mean().reset_index()
-        a = h.to_numpy()
-        for i in range(21): #mx 20
-            for ii in range(5): #mx 5
-                for iii in range(len(a[:])):
-                    if i == a[:,0][iii] and ii == a[:,1][iii]:
-                        z[int(i),int(ii)] = a[iii,2]
 
-        # Create the heatmap
-        plt.hist2d(x, y, weights = zz, cmap='hot')# bins=10,
+        def plot_heat_low(stati, p_b, z):
+            arr = np.asarray(stati,)
+            #p_b = 0.75
+            x = arr[:,1]
+            y = arr[:,0]
+            zz = arr[:,2]
+            #z = np.zeros((21,5))
+            ds = pd.DataFrame(arr,columns=['Q', 'T', 'p', 'x'])
+            ds['p'] = ds['p'].apply(Ambiente().price_normalise, args=(p_min, p_max))
+            h = ds.where(ds['p'] < -0.25).groupby(['Q','T','p']).mean().reset_index()
+            a = h.to_numpy()
+            for i in range(21): #mx 20
+                for ii in range(5): #mx 5
+                    for iii in range(len(a[:])):
+                        if i == a[:,0][iii] and ii == a[:,1][iii]:
+                            z[int(i),int(ii)] =  a[iii,3]
 
-        # Add a colorbar
-        plt.colorbar()
+            sns.heatmap(z,  cmap="YlGnBu" )
+            plt.title('average action conditioned to inventory and time ')
+            plt.xlabel('time - $p_n < -0.25$')
+            plt.ylabel('inventory')
+            plt.savefig('./Desktop/ennesima/HeatActTest_-025')
+            plt.close()
+            
+        def plot_heat_high(stati, p_b, z):
+            arr = np.asarray(stati,)
+            #p_b = 0.75
+            x = arr[:,1]
+            y = arr[:,0]
+            zz = arr[:,2]
+            #z = np.zeros((21,5))
+            ds = pd.DataFrame(arr,columns=['Q', 'T', 'p', 'x'])
+            ds['p'] = ds['p'].apply(Ambiente().price_normalise, args=(p_min, p_max))
+            h = ds.where(ds['p'] > 0.25).groupby(['Q','T','p']).mean().reset_index()
+            a = h.to_numpy()
+            for i in range(21): #mx 20
+                for ii in range(5): #mx 5
+                    for iii in range(len(a[:])):
+                        if i == a[:,0][iii] and ii == a[:,1][iii]:
+                            z[int(i),int(ii)] =  a[iii,3]
+            sns.heatmap(z,  cmap="YlGnBu" )
+            plt.title('average action conditioned to inventory and time ')
+            plt.xlabel('time - $p_n > 0.25$')
+            plt.ylabel('inventory')
+            plt.savefig('./Desktop/ennesima/HeatActTest_025')
+            plt.close()
 
-        # Add labels and a title
-        plt.xlabel('Q')
-        plt.ylabel('T')
-        plt.title('Heatmap states from test')
-        plt.show()
+        def plot_heat_within(stati, p_b, z):
+            arr = np.asarray(stati,)
+            #p_b = 0.75
+            x = arr[:,1]
+            y = arr[:,0]
+            zz = arr[:,2]
+            #z = np.zeros((21,5))
+            ds = pd.DataFrame(arr,columns=['Q', 'T', 'p', 'x'])
+            ds['p'] = ds['p'].apply(Ambiente().price_normalise, args=(p_min, p_max))
+            h = ds.where(-0.25<ds['p']).where(ds['p']<0.25).groupby(['Q','T','p']).mean().reset_index()
+            a = h.to_numpy()
+            for i in range(21): #mx 20
+                for ii in range(5): #mx 5
+                    for iii in range(len(a[:])):
+                        if i == a[:,0][iii] and ii == a[:,1][iii]:
+                            z[int(i),int(ii)] =  a[iii,3]
+            sns.heatmap(z,  cmap="YlGnBu" )
+            plt.title('average action conditioned to inventory and time ')
+            plt.xlabel('time - $-0.25 < p_n < 0.25$')
+            plt.ylabel('inventory')
+            plt.savefig('./Desktop/ennesima/HeatActTest_25025')
+            plt.close()
 
-        sns.heatmap(z)
-        plt.show()
-    
+
+        #for p_b in [-0.75, -0.5, -0.25, 0, 0.25, 0.5 ,0.75 ]:
+        plot_heat_low(stati, -0.25, z)
+        plot_heat_high(stati, 0.25, z)
+        plot_heat_within(stati, -25025, z)
+
+
+
     def run(n = 48_000, test = False):
         numIt = n
         numTr = int(numIt * 0.25)
-        #for i in range(3):
+        age = Agente(inventario = 20, numTrain = numIt)
 
-        age = Agente(inventario = 20, numTrain = numIt, epsilon = 1)
+        #for i in range(3):
         
-        act_mean, act_sd, act_hist, loss_mean, loss_sd, rew_mean, rew_sd, loss_hist, rew_hist, state, epsilon = doTrain(age, numIt)
+        act_mean, act_sd, act_hist, loss_mean, loss_sd, rew_mean, rew_sd, loss_hist, rew_hist, state, epsilon, p_min, p_max, restart = doTrain(age, numIt)
 
         #heat = get_heatmap(age)
 
         if test == True:
-            pel, sdPeL, azioni, azioni_med, sdaz, ricompensa, sdRic, re, tr, states, ql, ac =  doTest(age, numTr) #doAve(mean_list), act, doAve(act), doAve(re)
+            pel, sdPeL, azioni, azioni_med, sdaz, ricompensa, sdRic, re, tr, states, ql, ac =  doTest(age, p_min, p_max, restart, numTr) #doAve(mean_list), act, doAve(act), doAve(re)
             #return pel, azioni, azioni_med, ricompensa#a, a_var, a_t, b, b_var, c, c_var, pel, azioni, azioni_med, ricompensa, loss_hist, rew_hist
 
-            np.save('./Desktop/a_grafici/Q_T/-0_001/azioni', azioni) 
-            np.save('./Desktop/a_grafici/Q_T/-0_001/stati', states) 
-            np.save('./Desktop/a_grafici/Q_T/-0_001/stati_train', state)
-            np.save('./Desktop/a_grafici/Q_T/-0_001/trans', tr)
-            np.save('./Desktop/a_grafici/Q_T/-0_001/ql', ql)
-            np.save('./Desktop/a_grafici/Q_T/-0_001/ac', ac)
-            np.save('./Desktop/a_grafici/Q_T/-0_001/re', re)
-
+            np.save('./Desktop/ennesima/azioni', azioni) 
+            np.save('./Desktop/ennesima/azioniTrain', act_hist) 
+            np.save('./Desktop/ennesima/stati', states) 
+            np.save('./Desktop/ennesima/stati_train', state)
+            np.save('./Desktop/ennesima/trans', tr)
+            np.save('./Desktop/ennesima/ql', ql)
+            np.save('./Desktop/ennesima/ac', ac)
+            np.save('./Desktop/ennesima/re', re)
+            
             mu = (((ql.reshape(-1,5).sum(axis = 1) - ac.reshape(-1,5).sum(axis = 1)) / ac.reshape(-1,5).sum(axis = 1))).mean()*100
             si = (((ql.reshape(-1,5).sum(axis = 1) - ac.reshape(-1,5).sum(axis = 1)) / ac.reshape(-1,5).sum(axis = 1))).std()
 
-            #print('diff IS ave = ', mu,'%' ,'\n', 'diff IS sd = ', si)
+
+
             print('average PandL pct. =', mu, ', PandL sd = ', si ,
-            '\n',', last_act_test  =' , azioni[-5:] ,', act sd = ', sdaz ,
+            '\n',', med_act  =' , azioni[-5:] ,', act sd = ', sdaz ,
             '\n', ', rew ave =', ricompensa, ', rew sd =', sdRic,
             '\n',', average action chosen from train =', act_mean, 
             '\n', ', ave act test =', azioni_med, ', sd test act =', sdaz,
@@ -703,22 +832,24 @@ if __name__ == '__main__':
 
             sns.heatmap(np.asarray(state), cmap="YlGnBu" )
             plt.title('states explored in train')
-            plt.savefig('./Desktop/a_grafici/Q_T/-0_001/heatTrain.png')
+            plt.savefig('./Desktop/ennesima/statiTrain')
             plt.close() # train state
 
             heat_test(np.asarray(states)) # test states
-            heat     (np.asarray(states))
+            plot_heat_o(np.asarray(states), p_min, p_max)
 
             ranger = np.arange(0,5)
             plt.bar(ranger, azioni_med)
+            #plt.plot(azioni_med + sdaz / 2,  '--', color = 'g')
+            #plt.plot(azioni_med - sdaz / 2,  '--', color = 'g')
             plt.title('average action test')
-            plt.savefig('./Desktop/a_grafici/Q_T/-0_001/average_action_test.png')
+            plt.savefig('./Desktop/ennesima/avgActTest')
             plt.close()
             plt.plot(np.asarray(re))
             #plt.plot((20_000 - np.asarray(ac))/20_000)
             plt.ylabel('rewards')
             plt.xlabel('iterations')
-            plt.savefig('./Desktop/a_grafici/Q_T/-0_001/rewards.png')
+            plt.savefig('./Desktop/ennesima/rewards')
             plt.close()
             #plt.hist(re)
             #plt.xlabel('iterations')
@@ -726,13 +857,14 @@ if __name__ == '__main__':
             #plt.show()
             #plt.hist(   np.asarray(tr).reshape(-1,5).mean(1))
             #plt.axvline(np.asarray(tr).mean(), color = 'r')
-            #plt.show()
+            #plt.savefig('./Desktop/ennesima/tr')
+            #plt.close()
             plt.hist((((ql.reshape(-1,5).sum(axis = 1) - ac.reshape(-1,5).sum(axis = 1)) / ac.reshape(-1,5).sum(axis = 1))))
             plt.axvline((((ql.reshape(-1,5).sum(axis = 1) - ac.reshape(-1,5).sum(axis = 1)) / ac.reshape(-1,5).sum(axis = 1))).mean(), color = 'r')
-            plt.title('$\Delta \, \, IS$ of QL and AC, ABM - Q,T $\mu=0,\,\, \sigma=0.1$')
+            plt.title('$\Delta \, \, IS$ of QL and AC, ABM - Q,T,P $\mu=0,\,\, \sigma=0.1$')
             plt.ylabel('iterations')
             plt.xlabel('$\Delta \,\, IS$')
-            plt.savefig('./Desktop/a_grafici/Q_T/-0_001/deltaIS.png')
+            plt.savefig('./Desktop/ennesima/deltaIS.png')
             #plt.annotate(text=' $\Delta \,\, IS$ ave =  0.0029%', xy = [0.0025,2_500])
             #plt.annotate(text='  $\Delta \,\, IS$ sd =  0.0018', xy = [0.0025,2_300])
             plt.close()
@@ -766,3 +898,5 @@ if __name__ == '__main__':
     start_time = time.time()
     run(n = 20_000, test = True)
     #act_mean, act_sd, act_hist, loss_mean, loss_sd, rew_mean, rew_sd, loss_hist, rew_hist, heat, state = run(False)
+
+    
